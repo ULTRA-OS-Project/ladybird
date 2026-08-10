@@ -26,6 +26,7 @@ class GUIFramework(enum.IntEnum):
     Qt = enum.auto()
     AppKit = enum.auto()
     Android = enum.auto()
+    UltraCanvas = enum.auto()
 
     @classmethod
     def from_string(cls, gui: str) -> "GUIFramework":
@@ -100,8 +101,8 @@ class Platform:
         Keep in sync with Meta/CMake/gui_framework.cmake
         """
         if self.host_system == HostSystem.macOS:
-            return [GUIFramework.Qt, GUIFramework.AppKit]
-        return [GUIFramework.Qt]
+            return [GUIFramework.Qt, GUIFramework.AppKit, GUIFramework.UltraCanvas]
+        return [GUIFramework.Qt, GUIFramework.UltraCanvas]
 
     def default_gui_framework(self) -> GUIFramework:
         if self.host_system == HostSystem.macOS:

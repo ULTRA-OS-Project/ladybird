@@ -1,0 +1,3 @@
+[submodule "UI/UltraCanvas/UltraCanvasSources"]
+	path = UI/UltraCanvas/UltraCanvasSources
+	url = git@github.com:ULTRA-OS-Project/UltraCanvas.git
