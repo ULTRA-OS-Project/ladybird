@@ -408,9 +408,13 @@ private:
             return;
         }
 
+        // UltraCanvas reports ±1 per wheel notch (X11 Button4/5), and WebContent
+        // applies wheel_delta_y as device pixels — so a raw delta scrolls just 1px.
+        // Scale by a per-notch step to get a Chrome-like speed (Qt's backend uses 40px).
+        static constexpr double wheel_scroll_step_px = 40;
         double wheel_delta_y = 0;
         if (type == Web::MouseEvent::Type::MouseWheel)
-            wheel_delta_y = -static_cast<double>(event.wheelDelta);
+            wheel_delta_y = -static_cast<double>(event.wheelDelta) * wheel_scroll_step_px;
 
         enqueue_input_event(Web::MouseEvent {
             type, position, screen_position, button, buttons, modifiers_from(event),
