@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
@@ -79,5 +80,16 @@ std::string show_save_file_dialog(std::string const& title, std::string const& i
 // Show a blocking native "Open File" dialog. Returns the chosen absolute path, or an empty
 // string if the user cancelled (or no dialog could be shown). Used for Ctrl+O / "Open File…".
 std::string show_open_file_dialog(std::string const& title, std::string const& initial_directory);
+
+// Like show_open_file_dialog but allows selecting multiple files (for <input type=file multiple>).
+// Returns the chosen absolute paths (empty on cancel).
+std::vector<std::string> show_open_files_dialog(std::string const& title, std::string const& initial_directory);
+
+// Show a modal color picker (for <input type=color>), seeded with the given RGB. Non-blocking;
+// on_close is invoked exactly once when the dialog closes: accepted=true with the chosen RGB when
+// the user pressed OK, or accepted=false (RGB echoing the seed) on Cancel/Escape/close. Always
+// fires so the engine's color_picker_update() can run and the input isn't left waiting.
+void show_color_picker(uint8_t r, uint8_t g, uint8_t b,
+    std::function<void(bool accepted, uint8_t r, uint8_t g, uint8_t b)> on_close);
 
 }

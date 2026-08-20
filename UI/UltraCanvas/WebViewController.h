@@ -45,8 +45,9 @@ public:
     virtual double current_zoom() const = 0;
 
     // Find-in-page. start_find highlights all matches and jumps to the first;
-    // find_next/find_previous cycle; stop_find clears the highlight.
-    virtual void start_find(StringView query) = 0;
+    // find_next/find_previous cycle; stop_find clears the highlight. case_sensitive
+    // toggles the find bar's "match case" mode.
+    virtual void start_find(StringView query, bool case_sensitive = false) = 0;
     virtual void find_next() = 0;
     virtual void find_previous() = 0;
     virtual void stop_find() = 0;
@@ -72,6 +73,21 @@ public:
     // Reports find results: 1-based index of the active match and the total count
     // (both 0 when there are no matches).
     Function<void(size_t current, size_t total)> on_find_result;
+
+    // Window manipulation requested by the page (Fullscreen API, window.moveTo/resizeTo,
+    // window.minimize etc.). The view forwards these to the chrome, which drives the
+    // top-level UltraCanvas window (only the active tab should act on them).
+    Function<void()> on_enter_fullscreen;
+    Function<void()> on_exit_fullscreen;
+    Function<void()> on_minimize;
+    Function<void()> on_maximize;
+    Function<void()> on_restore;
+    Function<void(int x, int y)> on_move_window;
+    Function<void(int width, int height)> on_resize_window;
+
+    // The hovered link's URL changed. Non-empty => show it (status display); empty => nothing
+    // is hovered, hide the display.
+    Function<void(String url)> on_link_hover_change;
 };
 
 // The view exposed as both its control interface and its UltraCanvas element (for

@@ -51,7 +51,9 @@ add_subdirectory(UltraCanvasSources/UltraCanvas)
 add_executable(ladybird main.cpp)
 target_sources(ladybird PRIVATE
     Application.cpp
+    Autocomplete.cpp
     Bookmarks.cpp
+    Downloads.cpp
     EventLoopImplementationUltraCanvas.cpp
     UltraCanvasPlatform.cpp
     WebContentView.cpp

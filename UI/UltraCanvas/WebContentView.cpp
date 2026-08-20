@@ -21,9 +21,12 @@
 #include <LibWeb/Page/InputEvent.h>
 #include <LibWeb/UIEvents/KeyCode.h>
 #include <LibWeb/UIEvents/MouseButton.h>
+#include <LibWeb/HTML/ColorPickerUpdateState.h>
+#include <LibWeb/HTML/SelectedFile.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/Menu.h>
 #include <LibWebView/URL.h>
+#include <LibWebView/Utilities.h>
 #include <LibWebView/ViewImplementation.h>
 #include <LibWebView/WebContentClient.h>
 
@@ -278,6 +281,21 @@ public:
             }
         };
 
+        // Window manipulation (Fullscreen API, window.moveTo/resizeTo, minimize/maximize).
+        // Forward to the chrome, which drives the top-level UltraCanvas window across the firewall.
+        // (Qualify the left side: on_resize_window exists on both base classes.)
+        ViewImplementation::on_fullscreen_window = [this] { if (WebViewController::on_enter_fullscreen) WebViewController::on_enter_fullscreen(); };
+        ViewImplementation::on_exit_fullscreen_window = [this] { if (WebViewController::on_exit_fullscreen) WebViewController::on_exit_fullscreen(); };
+        ViewImplementation::on_minimize_window = [this] { if (WebViewController::on_minimize) WebViewController::on_minimize(); };
+        ViewImplementation::on_maximize_window = [this] { if (WebViewController::on_maximize) WebViewController::on_maximize(); };
+        ViewImplementation::on_restore_window = [this] { if (WebViewController::on_restore) WebViewController::on_restore(); };
+        ViewImplementation::on_reposition_window = [this](Gfx::IntPoint position) { if (WebViewController::on_move_window) WebViewController::on_move_window(position.x(), position.y()); };
+        ViewImplementation::on_resize_window = [this](Gfx::IntSize size) { if (WebViewController::on_resize_window) WebViewController::on_resize_window(size.width(), size.height()); };
+
+        // Hovered-link status display: forward the URL (empty on unhover) to the chrome.
+        on_link_hover = [this](URL::URL const& url) { if (WebViewController::on_link_hover_change) WebViewController::on_link_hover_change(url.serialize()); };
+        on_link_unhover = [this] { if (WebViewController::on_link_hover_change) WebViewController::on_link_hover_change(String {}); };
+
         // Reflect the page's hover cursor (pointer over links, I-beam over text, ...).
         // SetMouseCursor() is X11-free; the UltraCanvas app applies the hovered
         // element's cursor to the native window on the next pointer update.
@@ -368,6 +386,36 @@ public:
             show_select_dropdown(move(menu_items), window_x, window_y, minimum_width, [this] { select_dropdown_closed({}); });
         };
 
+        // <input type=file>: show a native open dialog (single or multiple) and hand the chosen
+        // files back to the engine. File filters are ignored for now (all files shown).
+        on_request_file_picker = [this](auto const&, Web::HTML::AllowMultipleFiles allow_multiple) {
+            Vector<Web::HTML::SelectedFile> selected_files;
+            auto add_path = [&](std::string const& path) {
+                if (path.empty())
+                    return;
+                if (auto file = WebView::create_selected_file(ByteString { path.data(), path.length() }); !file.is_error())
+                    selected_files.append(file.release_value());
+            };
+            if (allow_multiple == Web::HTML::AllowMultipleFiles::Yes) {
+                for (auto const& path : show_open_files_dialog("Select Files", std::string {}))
+                    add_path(path);
+            } else {
+                add_path(show_open_file_dialog("Select File", std::string {}));
+            }
+            file_picker_closed(move(selected_files));
+        };
+
+        // <input type=color>: show a modal color picker seeded with the current value; report the
+        // chosen color (or the unchanged one on cancel) back via color_picker_update(..., Closed).
+        on_request_color_picker = [this](Gfx::Color current_color) {
+            show_color_picker(current_color.red(), current_color.green(), current_color.blue(),
+                [this](bool accepted, u8 r, u8 g, u8 b) {
+                    color_picker_update(
+                        accepted ? Optional<Gfx::Color>(Gfx::Color(r, g, b)) : Optional<Gfx::Color> {},
+                        Web::HTML::ColorPickerUpdateState::Closed);
+                });
+        };
+
         // Seed a non-zero viewport before initialize_client(): the base sends the
         // initial viewport and registers the compositor context using viewport_size(),
         // which would otherwise be 0x0 until the first layout pass — leaving WebContent
@@ -455,7 +503,7 @@ public:
     virtual void reset_zoom() override { ViewImplementation::reset_zoom(); }
     virtual void set_zoom(double factor) override { ViewImplementation::set_zoom(factor); }
     virtual double current_zoom() const override { return zoom_level(); }
-    virtual void start_find(StringView query) override { ViewImplementation::find_in_page(Utf16String::from_utf8(query)); }
+    virtual void start_find(StringView query, bool case_sensitive) override { ViewImplementation::find_in_page(Utf16String::from_utf8(query), case_sensitive ? CaseSensitivity::CaseSensitive : CaseSensitivity::CaseInsensitive); }
     virtual void find_next() override { find_in_page_next_match(); }
     virtual void find_previous() override { find_in_page_previous_match(); }
     virtual void stop_find() override { ViewImplementation::find_in_page(Utf16String {}); }

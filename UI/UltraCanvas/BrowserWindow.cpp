@@ -11,10 +11,13 @@
 #include <AK/String.h>
 #include <LibCore/Resource.h>
 
+#include <UI/UltraCanvas/Autocomplete.h>
 #include <UI/UltraCanvas/BrowserWindow.h>
 #include <UI/UltraCanvas/Bookmarks.h>
+#include <UI/UltraCanvas/Downloads.h>
 #include <UI/UltraCanvas/UltraCanvasPlatform.h>
 
+#include <UltraCanvasAutoComplete.h>
 #include <UltraCanvasButton.h>
 #include <UltraCanvasClipboard.h>
 #include <UltraCanvasImage.h>
@@ -23,6 +26,7 @@
 #include <UltraCanvasTabbedContainer.h>
 #include <UltraCanvasTextInput.h>
 #include <UltraCanvasToolbar.h>
+#include <UltraCanvasTooltipManager.h>
 #include <UltraCanvasWindow.h>
 
 #include <memory>
@@ -110,6 +114,13 @@ public:
     struct Tab {
         WebViewHandle view;
         std::string url;
+        // What the address bar shows for this tab: the committed URL, or the user's in-progress
+        // edit. Kept per-tab so switching tabs saves/restores the address bar contents.
+        std::string address_text;
+        // Whether the address bar was focused for this tab, and its caret position — saved/restored
+        // on tab switch so focus and cursor follow the tab.
+        bool address_focused { false };
+        size_t address_caret { 0 };
         std::string title { "New Tab" };
         // The page's favicon (null => show the default globe). Kept so it can be restored when
         // loading finishes (the loading spinner overrides it while loading == true).
@@ -120,6 +131,12 @@ public:
     std::shared_ptr<UltraCanvas::UltraCanvasWindow> window;
     std::shared_ptr<UltraCanvas::UltraCanvasToolbar> toolbar;
     std::shared_ptr<UltraCanvas::UltraCanvasTextInput> address_bar;
+    // The address bar is an autocomplete control; kept here too for its AC-specific API. `ac_cache`
+    // holds the latest engine suggestions ({display, navigation value}) fed to onRequestSuggestions.
+    std::shared_ptr<UltraCanvas::UltraCanvasAutoComplete> address_autocomplete;
+    std::vector<std::pair<std::string, std::string>> ac_cache;
+    // Toolbar downloads button; shown with a count while downloads are active.
+    std::shared_ptr<UltraCanvas::UltraCanvasButton> downloads_button;
     std::shared_ptr<UltraCanvas::UltraCanvasTabbedContainer> tab_container;
     // Find-in-page bar (below the toolbar), hidden until Ctrl+F.
     std::shared_ptr<UltraCanvas::UltraCanvasToolbar> find_bar;
@@ -134,9 +151,19 @@ public:
     // while shown.
     std::shared_ptr<UltraCanvas::UltraCanvasMenu> bookmark_folder_popup;
     std::shared_ptr<UltraCanvas::UltraCanvasMenu> bookmark_context_menu;
+    // Right-click-on-a-tab context menu, kept alive while shown.
+    std::shared_ptr<UltraCanvas::UltraCanvasMenu> tab_context_menu;
     std::vector<Tab> tabs;
+    // The tab currently reflected in the chrome (address bar/focus). Tracked by controller pointer
+    // (stable across tab reordering, unlike an index) so we can save the outgoing tab's address bar
+    // state when the active tab changes. Only ever compared, never dereferenced.
+    WebViewController* shown_controller { nullptr };
     // Private-browsing window: its tabs use private views and the toolbar shows a "Private" badge.
     bool is_private { false };
+    // URLs of recently-closed tabs (most-recent last); Ctrl+Shift+T reopens the last one.
+    std::vector<std::string> closed_tab_urls;
+    // Find bar "match case" toggle state.
+    bool find_case_sensitive { false };
 
     int active_index() const { return tab_container ? tab_container->GetActiveTab() : -1; }
 
@@ -164,8 +191,19 @@ public:
     void apply_tab_icon(int index);
     void relayout();
     void close_active_tab();
+    void reopen_closed_tab(); // Ctrl+Shift+T: reopen the most-recently-closed tab
     void switch_to_adjacent_tab(int delta); // +1 = next, -1 = previous (wraps)
+    // Tab context-menu operations (all take an absolute tab index).
+    void show_tab_context_menu(int index, int window_x, int window_y);
+    void duplicate_tab(int index);
+    void close_tab_at(int index);       // closes one tab (closes the window when it's the last)
+    void close_other_tabs(int keep);
+    void close_tabs_to_left(int index);
+    void close_tabs_to_right(int index);
+    void move_tab(int from, int to);    // reorder; onTabReorder keeps the tabs vector in sync
+    void erase_tab(int index);          // remove a tab without the last-tab-closes-window rule
     void open_file();                       // native open dialog -> load the chosen file
+    void update_downloads_button();         // refresh the toolbar downloads button label/visibility
     void toggle_find_bar(bool show);
     void open_internal_page(char const* about_url);
     void show_main_menu();
@@ -216,6 +254,8 @@ void BrowserWindowState::add_tab(WebViewHandle handle, bool activate)
             if (index < 0)
                 return;
             state->tabs[index].url = to_std_string(url);
+            // Navigation replaces any in-progress edit with the loaded URL.
+            state->tabs[index].address_text = state->tabs[index].url;
             if (index == state->active_index() && state->address_bar && !state->address_bar->IsFocused())
                 state->address_bar->SetText(state->tabs[index].url);
         };
@@ -249,6 +289,33 @@ void BrowserWindowState::add_tab(WebViewHandle handle, bool activate)
             if (state->active_controller() != raw_controller)
                 return;
             state->find_label->SetText(std::to_string(current) + "/" + std::to_string(total));
+        };
+
+        // Window manipulation from the page (Fullscreen API, window.moveTo/resizeTo, minimize…).
+        // Only the active tab may drive the top-level window. Each acts on state->window.
+        auto is_active = [self, raw_controller] { auto s = self.lock(); return s && s->active_controller() == raw_controller; };
+        raw_controller->on_enter_fullscreen = [self, is_active] { if (is_active()) if (auto s = self.lock()) s->window->SetFullscreen(true); };
+        raw_controller->on_exit_fullscreen = [self, is_active] { if (is_active()) if (auto s = self.lock()) s->window->SetFullscreen(false); };
+        raw_controller->on_minimize = [self, is_active] { if (is_active()) if (auto s = self.lock()) s->window->Minimize(); };
+        raw_controller->on_maximize = [self, is_active] { if (is_active()) if (auto s = self.lock()) s->window->Maximize(); };
+        raw_controller->on_restore = [self, is_active] { if (is_active()) if (auto s = self.lock()) s->window->Restore(); };
+        raw_controller->on_move_window = [self, is_active](int x, int y) { if (is_active()) if (auto s = self.lock()) s->window->SetWindowPosition(x, y); };
+        raw_controller->on_resize_window = [self, is_active](int w, int h) { if (is_active()) if (auto s = self.lock()) s->window->SetWindowSize(w, h); };
+
+        // Hovered-link status: show the URL in a tooltip near the window's bottom-left (like a
+        // status bar), hide it when nothing is hovered. Active tab only.
+        raw_controller->on_link_hover_change = [self, raw_controller](String url) {
+            auto s = self.lock();
+            if (!s || s->active_controller() != raw_controller)
+                return;
+            if (url.is_empty()) {
+                UltraCanvas::UltraCanvasTooltipManager::HideTooltipImmediately();
+                return;
+            }
+            int w = 0, h = 0;
+            s->window->GetWindowSize(w, h);
+            UltraCanvas::UltraCanvasTooltipManager::UpdateAndShowTooltipImmediately(
+                s->window.get(), to_std_string(url), UltraCanvas::Point2Di(8, h - 30));
         };
     }
 
@@ -300,8 +367,39 @@ void BrowserWindowState::on_active_changed()
 
     if (active >= 0 && active < static_cast<int>(tabs.size())) {
         window->SetWindowTitle(tabs[active].title.empty() ? std::string { "Ladybird" } : tabs[active].title);
-        if (address_bar && !address_bar->IsFocused())
-            address_bar->SetText(tabs[active].url);
+
+        auto* active_controller = tabs[active].view.controller.get();
+        bool switched = (shown_controller != active_controller);
+        // On a real tab switch, save the outgoing tab's address bar edit state (text + focus + caret)
+        // so it is restored when the user returns to that tab. Located by controller (its index may
+        // have shifted since it was last shown); skipped if it has since been closed.
+        if (switched && shown_controller && address_bar) {
+            if (int old_index = index_of(shown_controller); old_index >= 0) {
+                tabs[old_index].address_text = address_bar->GetText();
+                tabs[old_index].address_focused = address_bar->IsFocused();
+                tabs[old_index].address_caret = address_bar->GetCaretPosition();
+            }
+        }
+        // Restore this tab's address bar contents (URL or saved in-progress edit). SetText() does not
+        // fire onTextChanged, so this never clobbers a tab's own saved edit.
+        if (address_bar) {
+            address_bar->SetText(tabs[active].address_text);
+            if (switched) {
+                if (tabs[active].address_focused) {
+                    // This tab was mid-edit: refocus the address bar and restore the caret.
+                    window->SetFocusedElement(address_bar.get());
+                    address_bar->SetCaretPosition(tabs[active].address_caret);
+                } else if (address_bar->IsFocused()) {
+                    // Switching to a tab that wasn't being edited: don't leave the address bar focused
+                    // (it would keep a stale caret and suppress the URL). Give focus to the web view.
+                    if (auto* view = tabs[active].view.element.get())
+                        window->SetFocusedElement(view);
+                    else
+                        window->ClearFocus();
+                }
+            }
+        }
+        shown_controller = active_controller;
     }
 }
 
@@ -337,7 +435,7 @@ void BrowserWindowState::toggle_find_bar(bool show)
             find_input->SelectAll();
             auto query = find_input->GetText();
             if (auto* controller = active_controller(); controller && !query.empty())
-                controller->start_find(StringView { query.data(), query.length() });
+                controller->start_find(StringView { query.data(), query.length() }, find_case_sensitive);
         }
     } else {
         if (auto* controller = active_controller())
@@ -357,10 +455,132 @@ void BrowserWindowState::close_active_tab()
     int active = tab_container->GetActiveTab();
     if (active < 0 || active >= static_cast<int>(tabs.size()))
         return;
+    // Remember the URL so Ctrl+Shift+T can reopen it.
+    if (!tabs[active].url.empty() && tabs[active].url != "about:blank")
+        closed_tab_urls.push_back(tabs[active].url);
     // Drop our record first so indices stay aligned with the container when RemoveTab
     // fires onTabChange -> on_active_changed().
     tabs.erase(tabs.begin() + active);
     tab_container->RemoveTab(active);
+}
+
+void BrowserWindowState::reopen_closed_tab()
+{
+    // Pop the most-recently-closed tab's URL and open it in a fresh foreground tab.
+    while (!closed_tab_urls.empty()) {
+        auto url = closed_tab_urls.back();
+        closed_tab_urls.pop_back();
+        if (url.empty())
+            continue;
+        add_tab(create_web_content_view(is_private), true);
+        if (auto* c = active_controller())
+            c->load(StringView { url.data(), url.length() });
+        return;
+    }
+}
+
+void BrowserWindowState::erase_tab(int index)
+{
+    if (index < 0 || index >= static_cast<int>(tabs.size()))
+        return;
+    // Remember the URL so Ctrl+Shift+T can reopen it.
+    if (!tabs[index].url.empty() && tabs[index].url != "about:blank")
+        closed_tab_urls.push_back(tabs[index].url);
+    tabs.erase(tabs.begin() + index);
+    tab_container->RemoveTab(index);
+}
+
+void BrowserWindowState::close_tab_at(int index)
+{
+    if (index < 0 || index >= static_cast<int>(tabs.size()))
+        return;
+    // Closing the last tab closes the window (which exits the app when it's the last window).
+    if (tabs.size() <= 1) {
+        window->Close();
+        return;
+    }
+    erase_tab(index);
+    on_active_changed();
+}
+
+void BrowserWindowState::close_other_tabs(int keep)
+{
+    if (keep < 0 || keep >= static_cast<int>(tabs.size()))
+        return;
+    // Remove high→low so earlier indices stay valid; skip the kept tab.
+    for (int i = static_cast<int>(tabs.size()) - 1; i >= 0; --i) {
+        if (i == keep)
+            continue;
+        erase_tab(i);
+    }
+    on_active_changed();
+}
+
+void BrowserWindowState::close_tabs_to_left(int index)
+{
+    for (int i = index - 1; i >= 0; --i)
+        erase_tab(i);
+    on_active_changed();
+}
+
+void BrowserWindowState::close_tabs_to_right(int index)
+{
+    for (int i = static_cast<int>(tabs.size()) - 1; i > index; --i)
+        erase_tab(i);
+    on_active_changed();
+}
+
+void BrowserWindowState::duplicate_tab(int index)
+{
+    if (index < 0 || index >= static_cast<int>(tabs.size()))
+        return;
+    auto url = tabs[index].url;
+    add_tab(create_web_content_view(is_private), true);
+    if (auto* c = active_controller(); c && !url.empty())
+        c->load(StringView { url.data(), url.length() });
+}
+
+void BrowserWindowState::move_tab(int from, int to)
+{
+    int count = static_cast<int>(tabs.size());
+    if (from < 0 || from >= count || to < 0 || to >= count || from == to)
+        return;
+    // ReorderTabs reorders the container and fires onTabReorder, which syncs our tabs vector.
+    tab_container->ReorderTabs(from, to);
+}
+
+void BrowserWindowState::show_tab_context_menu(int index, int window_x, int window_y)
+{
+    using UltraCanvas::MenuItemData;
+    if (index < 0 || index >= static_cast<int>(tabs.size()))
+        return;
+    auto self = weak_from_this();
+    if (!tab_context_menu) {
+        tab_context_menu = std::make_shared<UltraCanvas::UltraCanvasMenu>("tab-context");
+        tab_context_menu->SetMenuType(UltraCanvas::MenuType::PopupMenu);
+    }
+    tab_context_menu->Clear();
+
+    int count = static_cast<int>(tabs.size());
+    tab_context_menu->AddItem(MenuItemData::Action("Reload", [self, index] { if (auto s = self.lock()) if (auto* c = s->controller_at(index)) c->reload(); }));
+    tab_context_menu->AddItem(MenuItemData::Action("Duplicate Tab", [self, index] { if (auto s = self.lock()) s->duplicate_tab(index); }));
+    tab_context_menu->AddItem(MenuItemData::Separator());
+    tab_context_menu->AddItem(MenuItemData::Action("Move to Start", [self, index] { if (auto s = self.lock()) s->move_tab(index, 0); }));
+    tab_context_menu->AddItem(MenuItemData::Action("Move to End", [self, index] { if (auto s = self.lock()) s->move_tab(index, static_cast<int>(s->tabs.size()) - 1); }));
+    tab_context_menu->AddItem(MenuItemData::Separator());
+    tab_context_menu->AddItem(MenuItemData::Action("Close Tab", [self, index] { if (auto s = self.lock()) s->close_tab_at(index); }));
+    // Only offer the range/other closers when they'd actually close something.
+    if (index > 0)
+        tab_context_menu->AddItem(MenuItemData::Action("Close Tabs to the Left", [self, index] { if (auto s = self.lock()) s->close_tabs_to_left(index); }));
+    if (index < count - 1)
+        tab_context_menu->AddItem(MenuItemData::Action("Close Tabs to the Right", [self, index] { if (auto s = self.lock()) s->close_tabs_to_right(index); }));
+    if (count > 1)
+        tab_context_menu->AddItem(MenuItemData::Action("Close Other Tabs", [self, index] { if (auto s = self.lock()) s->close_other_tabs(index); }));
+
+    UltraCanvas::PopupElementSettings settings;
+    settings.closeByEscapeKey = true;
+    settings.closeByClickOutside = true;
+    tab_context_menu->OpenMenu(UltraCanvas::Point2Di(window_x, window_y), *window, settings);
 }
 
 void BrowserWindowState::switch_to_adjacent_tab(int delta)
@@ -382,6 +602,19 @@ void BrowserWindowState::open_file()
         return;
     if (auto* controller = active_controller())
         controller->load(StringView { path.data(), path.length() });
+}
+
+void BrowserWindowState::update_downloads_button()
+{
+    if (!downloads_button)
+        return;
+    int count = active_download_count();
+    if (count > 0) {
+        downloads_button->SetText("\xE2\xAC\x87 " + std::to_string(count)); // ⬇ N
+        downloads_button->SetVisible(true);
+    } else {
+        downloads_button->SetVisible(false);
+    }
 }
 
 void BrowserWindowState::open_internal_page(char const* about_url)
@@ -664,18 +897,69 @@ void open_browser_window(WebViewHandle const& first_view, StringView initial_url
     auto reload_button = toolbar->AddButton("reload", "", "", [self] { if (auto s = self.lock()) if (auto* c = s->active_controller()) c->reload(); });
     set_toolbar_icon(reload_button, "resource://icons/browser/rotate-cw.svg"sv);
 
-    auto address_bar = toolbar->AddSearchBox("address-bar", "Enter address");
-    state->address_bar = address_bar;
+    // The address bar is an autocomplete control: typing queries the engine (history + bookmarks +
+    // search suggestions) asynchronously; results are pushed into ac_cache and shown via the
+    // control's built-in popup (which handles Up/Down/Enter selection natively).
+    auto address_bar = toolbar->AddAutoComplete("address-bar", "Enter address", [self](std::string const& text) {
+        auto s = self.lock();
+        if (!s)
+            return;
+        // Remember the in-progress edit for the active tab so switching tabs saves/restores it.
+        if (auto ai = s->active_index(); ai >= 0 && ai < static_cast<int>(s->tabs.size()))
+            s->tabs[ai].address_text = text;
+        if (text.empty()) {
+            s->ac_cache.clear();
+            if (s->address_autocomplete)
+                s->address_autocomplete->RefreshSuggestions();
+            return;
+        }
+        request_autocomplete(text, s->is_private, [self](std::string query, std::vector<std::pair<std::string, std::string>> results) {
+            auto s2 = self.lock();
+            if (!s2 || !s2->address_autocomplete)
+                return;
+            // Drop stale responses: the user kept typing since this query was issued.
+            if (s2->address_autocomplete->GetText() != query)
+                return;
+            s2->ac_cache = std::move(results);
+            s2->address_autocomplete->RefreshSuggestions();
+        });
+    });
+    state->address_autocomplete = address_bar;
+    state->address_bar = address_bar; // upcast; existing chrome uses the TextInput base API
     if (address_bar) {
         address_bar->SetElementSize(UltraCanvas::CSSLayout::Dimension::Px(0), UltraCanvas::CSSLayout::Dimension::Px(28));
         address_bar->layoutItem.SetFlexGrow(1.0f);
+        // Enter navigates to the typed text (works when no suggestion popup is open).
         address_bar->onEnterPressed = [self](std::string const& text) -> bool {
             if (auto s = self.lock())
                 if (auto* c = s->active_controller())
                     c->load(StringView { text.data(), text.length() });
             return true;
         };
+        // Provider: hand the control our async-populated suggestions as-is (already ranked).
+        address_bar->onRequestSuggestions = [self](std::string const&) -> std::vector<UltraCanvas::AutoCompleteItem> {
+            std::vector<UltraCanvas::AutoCompleteItem> items;
+            if (auto s = self.lock()) {
+                items.reserve(s->ac_cache.size());
+                for (auto const& [display, value] : s->ac_cache)
+                    items.emplace_back(display, value);
+            }
+            return items;
+        };
+        // Picking a suggestion navigates to its value (URL or search term).
+        address_bar->onItemSelected = [self](int, UltraCanvas::AutoCompleteItem const& item) {
+            auto s = self.lock();
+            if (!s)
+                return;
+            if (auto* c = s->active_controller())
+                c->load(StringView { item.value.data(), item.value.length() });
+        };
     }
+
+    // Downloads button (right of the address bar): opens about:downloads, shows a live count while
+    // downloads are active. Hidden when there are none.
+    auto downloads_button = toolbar->AddButton("downloads", "", "", [self] { if (auto s = self.lock()) s->open_internal_page("about:downloads"); });
+    state->downloads_button = downloads_button;
 
     // "Private" badge (right of the address bar), only in private-browsing windows.
     if (is_private)
@@ -693,6 +977,24 @@ void open_browser_window(WebViewHandle const& first_view, StringView initial_url
     state->tab_container = tab_container;
 
     tab_container->onTabChange = [self](int, int) { if (auto s = self.lock()) s->on_active_changed(); };
+    // Right-click a tab: show the tab context menu (reload / duplicate / move / close variants).
+    tab_container->onTabContextMenu = [self](int index, int window_x, int window_y) {
+        if (auto s = self.lock())
+            s->show_tab_context_menu(index, window_x, window_y);
+    };
+    // Drag-to-reorder tabs; keep our parallel tabs vector in sync with the container's order.
+    tab_container->allowTabReordering = true;
+    tab_container->onTabReorder = [self](int from, int to) {
+        auto s = self.lock();
+        if (!s)
+            return;
+        if (from < 0 || to < 0 || from >= static_cast<int>(s->tabs.size()) || to >= static_cast<int>(s->tabs.size()))
+            return;
+        auto tab = std::move(s->tabs[from]);
+        s->tabs.erase(s->tabs.begin() + from);
+        s->tabs.insert(s->tabs.begin() + to, std::move(tab));
+        s->on_active_changed();
+    };
     tab_container->onNewTabRequest = [self] {
         auto s = self.lock();
         if (!s)
@@ -710,8 +1012,12 @@ void open_browser_window(WebViewHandle const& first_view, StringView initial_url
             s->window->Close();
             return true;
         }
-        if (index >= 0 && index < static_cast<int>(s->tabs.size()))
+        if (index >= 0 && index < static_cast<int>(s->tabs.size())) {
+            // Remember the URL so Ctrl+Shift+T can reopen it.
+            if (!s->tabs[index].url.empty() && s->tabs[index].url != "about:blank")
+                s->closed_tab_urls.push_back(s->tabs[index].url);
             s->tabs.erase(s->tabs.begin() + index);
+        }
         // The container removes its own tab entry (we returned true); refresh active state
         // on the next event loop turn via onTabChange.
         return true;
@@ -730,7 +1036,7 @@ void open_browser_window(WebViewHandle const& first_view, StringView initial_url
             if (text.empty())
                 c->stop_find();
             else
-                c->start_find(StringView { text.data(), text.length() });
+                c->start_find(StringView { text.data(), text.length() }, s->find_case_sensitive);
         }
     });
     state->find_input = find_input;
@@ -744,6 +1050,22 @@ void open_browser_window(WebViewHandle const& first_view, StringView initial_url
             return true;
         };
     }
+    // "Match case" toggle: flip the flag and re-run the current query with the new mode.
+    find_bar->AddToggleButton("find-case", "Aa", "", [self](bool checked) {
+        auto s = self.lock();
+        if (!s)
+            return;
+        s->find_case_sensitive = checked;
+        if (s->find_input) {
+            auto query = s->find_input->GetText();
+            if (auto* c = s->active_controller()) {
+                if (query.empty())
+                    c->stop_find();
+                else
+                    c->start_find(StringView { query.data(), query.length() }, s->find_case_sensitive);
+            }
+        }
+    });
     find_bar->AddButton("find-prev", "Prev", "", [self] { if (auto s = self.lock()) if (auto* c = s->active_controller()) c->find_previous(); });
     find_bar->AddButton("find-next", "Next", "", [self] { if (auto s = self.lock()) if (auto* c = s->active_controller()) c->find_next(); });
     state->find_label = find_bar->AddLabel("find-count", "");
@@ -794,6 +1116,11 @@ void open_browser_window(WebViewHandle const& first_view, StringView initial_url
                 s->toggle_find_bar(false);
                 return true;
             }
+            // F11 toggles fullscreen (no modifier).
+            if (event.virtualKey == UltraCanvas::UCKeys::F11) {
+                s->window->SetFullscreen(!s->window->IsFullscreen());
+                return true;
+            }
             if (!event.ctrl)
                 return false;
             // Ctrl+Shift shortcuts (bookmarks bar / bookmark all tabs / new private window).
@@ -807,6 +1134,9 @@ void open_browser_window(WebViewHandle const& first_view, StringView initial_url
                     return true;
                 case UltraCanvas::UCKeys::N: // new private window
                     open_url_in_new_browser_window("about:blank"sv, true);
+                    return true;
+                case UltraCanvas::UCKeys::T: // reopen the last-closed tab
+                    s->reopen_closed_tab();
                     return true;
                 default:
                     return false;
@@ -888,11 +1218,17 @@ void open_browser_window(WebViewHandle const& first_view, StringView initial_url
             for (auto& w : s_windows)
                 w->apply_bookmarks_bar_visibility();
         });
+        // Refresh every window's downloads button as downloads start/progress/finish.
+        set_on_downloads_changed([] {
+            for (auto& w : s_windows)
+                w->update_downloads_button();
+        });
     }
 
     // First tab uses the view created by the caller.
     state->add_tab(first_view, true);
     state->apply_bookmarks_bar_visibility(); // populate + show/hide per setting (also relayouts)
+    state->update_downloads_button();        // hidden until a download is active
     state->relayout();
 
     window->Show();

@@ -14,6 +14,7 @@
 #include <memory>
 
 #include <UltraCanvasApplication.h>
+#include <UltraCanvasColorPicker.h>
 #include <UltraCanvasMenu.h>
 #include <UltraCanvasModalDialog.h>
 #include <UltraCanvasNativeDialogs.h>
@@ -225,6 +226,56 @@ std::string show_open_file_dialog(std::string const& title, std::string const& i
 {
     // Blocking GTK open dialog (returns "" on cancel or if GTK can't initialize).
     return UltraCanvas::UltraCanvasNativeDialogs::OpenFile(title, {}, initial_directory, nullptr);
+}
+
+std::vector<std::string> show_open_files_dialog(std::string const& title, std::string const& initial_directory)
+{
+    return UltraCanvas::UltraCanvasNativeDialogs::OpenMultipleFiles(title, {}, initial_directory, nullptr);
+}
+
+void show_color_picker(uint8_t r, uint8_t g, uint8_t b,
+    std::function<void(bool, uint8_t, uint8_t, uint8_t)> on_close)
+{
+    try {
+        UltraCanvas::DialogConfig config;
+        config.title = "Select Color";
+        config.width = 330;
+        config.height = 560;
+        config.buttons = UltraCanvas::DialogButtons::NoButtons; // custom OK/Cancel added below
+
+        auto dialog = UltraCanvas::UltraCanvasDialogManager::CreateDialog(config);
+        if (!dialog) {
+            // Dialogs disabled — unblock the engine with the unchanged color.
+            if (on_close)
+                on_close(false, r, g, b);
+            return;
+        }
+
+        auto picker = UltraCanvas::CreateColorPicker("web-color-picker", UltraCanvas::Color(r, g, b, 255));
+        // Keep the picker at its natural size within the dialog's flex layout.
+        picker->layoutItem.SetFlexGrow(0).SetFlexShrink(0);
+        dialog->AddDialogElement(picker);
+        dialog->AddCustomButton("OK", UltraCanvas::DialogResult::OK, nullptr);
+        dialog->AddCustomButton("Cancel", UltraCanvas::DialogResult::Cancel, nullptr);
+
+        // Report exactly once, on any close path (OK / Cancel / Escape / window close). Capturing
+        // `picker` keeps it alive until the result callback runs.
+        auto reported = std::make_shared<bool>(false);
+        UltraCanvas::UltraCanvasDialogManager::ShowDialog(
+            dialog,
+            [picker, on_close, reported](UltraCanvas::DialogResult result) {
+                if (*reported)
+                    return;
+                *reported = true;
+                auto c = picker->GetColor();
+                if (on_close)
+                    on_close(result == UltraCanvas::DialogResult::OK, c.r, c.g, c.b);
+            },
+            focused_window());
+    } catch (...) {
+        if (on_close)
+            on_close(false, r, g, b);
+    }
 }
 
 }
