@@ -11,8 +11,12 @@
 
 #include <UI/UltraCanvas/UltraCanvasPlatform.h>
 
+#include <memory>
+
 #include <UltraCanvasApplication.h>
+#include <UltraCanvasMenu.h>
 #include <UltraCanvasModalDialog.h>
+#include <UltraCanvasNativeDialogs.h>
 #include <UltraCanvasWindow.h>
 
 namespace Ladybird {
@@ -98,6 +102,129 @@ void show_prompt_dialog(std::string const& message, std::string const& default_v
         if (on_close)
             on_close(false, std::string {});
     }
+}
+
+// ===== CONTEXT MENUS =====
+// OpenPopup() stores the menu by raw pointer, so it must stay alive while shown. One
+// context menu is up at a time; hold it here and release on close (deferred, since we
+// clear from within the menu's own close callback).
+static std::shared_ptr<UltraCanvas::UltraCanvasMenu> s_context_menu;
+// Same lifetime rule for the HTML <select> dropdown popup.
+static std::shared_ptr<UltraCanvas::UltraCanvasMenu> s_select_dropdown;
+
+static UltraCanvas::MenuItemData to_menu_item(ContextMenuItem const& item)
+{
+    using UltraCanvas::MenuItemData;
+
+    if (item.is_separator)
+        return MenuItemData::Separator();
+
+    if (!item.submenu.empty()) {
+        std::vector<MenuItemData> children;
+        children.reserve(item.submenu.size());
+        for (auto const& child : item.submenu)
+            children.push_back(to_menu_item(child));
+        auto data = MenuItemData::Submenu(item.label, children);
+        data.enabled = item.enabled;
+        return data;
+    }
+
+    MenuItemData data = item.checkable
+        ? MenuItemData::Checkbox(item.label, item.checked, [callback = item.on_activate](bool) { if (callback) callback(); })
+        : MenuItemData::Action(item.label, item.on_activate ? item.on_activate : [] { });
+    data.enabled = item.enabled;
+    return data;
+}
+
+void show_context_menu(std::vector<ContextMenuItem> items, int window_x, int window_y)
+{
+    auto* window = focused_window();
+    if (!window)
+        return;
+
+    auto menu = std::make_shared<UltraCanvas::UltraCanvasMenu>("web-context-menu");
+    menu->SetMenuType(UltraCanvas::MenuType::PopupMenu);
+    menu->onMenuClosed = [] {
+        // Release the held menu after this close callback returns.
+        if (auto* app = UltraCanvas::UltraCanvasApplication::GetInstance())
+            app->PostToUIThread([] { s_context_menu.reset(); });
+    };
+
+    for (auto const& item : items)
+        menu->AddItem(to_menu_item(item));
+
+    UltraCanvas::PopupElementSettings settings;
+    settings.closeByEscapeKey = true;
+    settings.closeByClickOutside = true;
+
+    s_context_menu = menu;
+    menu->OpenMenu(UltraCanvas::Point2Di(window_x, window_y), *window, settings);
+}
+
+void show_select_dropdown(std::vector<ContextMenuItem> items, int window_x, int window_y, int minimum_width, std::function<void()> on_dismiss)
+{
+    auto* window = focused_window();
+    if (!window) {
+        // Can't show the popup — unblock the engine so the <select> isn't left waiting.
+        if (on_dismiss)
+            on_dismiss();
+        return;
+    }
+
+    // Report either the chosen option OR a dismissal, never both: each item's activation sets
+    // this flag, and the close handler only reports a dismissal if nothing was picked.
+    auto picked = std::make_shared<bool>(false);
+    for (auto& item : items) {
+        if (item.on_activate) {
+            auto activate = item.on_activate;
+            item.on_activate = [picked, activate] {
+                *picked = true;
+                activate();
+            };
+        }
+    }
+
+    auto menu = std::make_shared<UltraCanvas::UltraCanvasMenu>("web-select-dropdown");
+    menu->SetMenuType(UltraCanvas::MenuType::PopupMenu);
+    // Make the dropdown at least as wide as the <select> control it drops from.
+    if (minimum_width > 0) {
+        auto style = menu->GetStyle();
+        style.minWidth = minimum_width;
+        menu->SetStyle(style);
+    }
+    menu->onMenuClosed = [picked, on_dismiss] {
+        // Defer to the next UI turn: an item's on_activate runs synchronously before the menu
+        // closes, so by the time this fires `picked` is settled. Also releases the held popup.
+        if (auto* app = UltraCanvas::UltraCanvasApplication::GetInstance())
+            app->PostToUIThread([picked, on_dismiss] {
+                if (!*picked && on_dismiss)
+                    on_dismiss();
+                s_select_dropdown.reset();
+            });
+    };
+
+    for (auto const& item : items)
+        menu->AddItem(to_menu_item(item));
+
+    UltraCanvas::PopupElementSettings settings;
+    settings.closeByEscapeKey = true;
+    settings.closeByClickOutside = true;
+
+    s_select_dropdown = menu;
+    menu->OpenMenu(UltraCanvas::Point2Di(window_x, window_y), *window, settings);
+}
+
+std::string show_save_file_dialog(std::string const& title, std::string const& initial_directory, std::string const& suggested_name)
+{
+    // Blocking GTK save dialog (returns "" on cancel or if GTK can't initialize). No filters —
+    // the caller downloads whatever the link points at.
+    return UltraCanvas::UltraCanvasNativeDialogs::SaveFile(title, {}, initial_directory, suggested_name, nullptr);
+}
+
+std::string show_open_file_dialog(std::string const& title, std::string const& initial_directory)
+{
+    // Blocking GTK open dialog (returns "" on cancel or if GTK can't initialize).
+    return UltraCanvas::UltraCanvasNativeDialogs::OpenFile(title, {}, initial_directory, nullptr);
 }
 
 }

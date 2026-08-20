@@ -24,6 +24,12 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 {
     auto app = TRY(Ladybird::Application::create(arguments));
 
+    // Default to a search engine so non-URL text typed in the address bar performs a web search.
+    // Only set it when the user hasn't already chosen one (persisted in Settings.json and
+    // changeable in about:settings).
+    if (!WebView::Application::settings().search_engine().has_value())
+        WebView::Application::settings().set_search_engine("Google"sv);
+
     if (!WebView::Application::browser_options().headless_mode.has_value()) {
         auto const& urls = WebView::Application::browser_options().urls;
         String initial_url = urls.is_empty() ? "about:blank"_string : urls.first().serialize();

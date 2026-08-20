@@ -23,6 +23,17 @@ list(TRANSFORM 32x32_ICONS PREPEND "${LADYBIRD_SOURCE_DIR}/Base/res/icons/32x32/
 list(TRANSFORM 48x48_ICONS PREPEND "${LADYBIRD_SOURCE_DIR}/Base/res/icons/48x48/")
 list(TRANSFORM 128x128_ICONS PREPEND "${LADYBIRD_SOURCE_DIR}/Base/res/icons/128x128/")
 
+# Scalable SVG glyphs for the UltraCanvas browser chrome (back/forward/reload).
+# Kept co-located with the UI that uses them under UI/UltraCanvas/res/icons/.
+set(BROWSER_ICONS
+    arrow-left.svg
+    arrow-right.svg
+    rotate-cw.svg
+    globe.svg
+    loading.gif
+)
+list(TRANSFORM BROWSER_ICONS PREPEND "${LADYBIRD_SOURCE_DIR}/UI/UltraCanvas/res/icons/")
+
 set(INTERNAL_RESOURCES
     ladybird.css
     utils.js
@@ -151,6 +162,10 @@ function(copy_resources_to_build base_directory bundle_target)
         DESTINATION ${base_directory} TARGET ${bundle_target}
     )
 
+    copy_resource_set(icons/browser RESOURCES ${BROWSER_ICONS}
+        DESTINATION ${base_directory} TARGET ${bundle_target}
+    )
+
     copy_resource_set(themes RESOURCES ${THEMES}
         DESTINATION ${base_directory} TARGET ${bundle_target}
     )
@@ -198,6 +213,7 @@ function(install_ladybird_resources destination component)
     install(FILES ${32x32_ICONS} DESTINATION "${destination}/icons/32x32" COMPONENT ${component})
     install(FILES ${48x48_ICONS} DESTINATION "${destination}/icons/48x48" COMPONENT ${component})
     install(FILES ${128x128_ICONS} DESTINATION "${destination}/icons/128x128" COMPONENT ${component})
+    install(FILES ${BROWSER_ICONS} DESTINATION "${destination}/icons/browser" COMPONENT ${component})
     install(FILES ${THEMES} DESTINATION "${destination}/themes" COMPONENT ${component})
     install(FILES ${INTERNAL_RESOURCES} DESTINATION "${destination}/ladybird" COMPONENT ${component})
     install(FILES ${ABOUT_PAGES} DESTINATION "${destination}/ladybird/about-pages" COMPONENT ${component})

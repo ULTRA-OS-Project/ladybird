@@ -23,15 +23,21 @@ add_compile_options(
 )
 
 # --- Trim the UltraCanvas build to what the browser chrome needs ---
-# Disable every optional plugin plus networking, audio, video and GL surfaces:
-# the browser UI uses none of them, and turning them off keeps the dependency
-# surface and build time down (and sidesteps the cargo/tesseract/MuPDF/microtex
+# Disable every optional plugin plus networking, audio, video, GL surfaces and the
+# database module: the browser UI uses none of them, and turning them off keeps the
+# dependency surface and build time down (and sidesteps the cargo/tesseract/MuPDF/microtex
 # toolchains those plugins pull in).
-set(ULTRACANVAS_BUILD_SHARED OFF CACHE BOOL "" FORCE)
-set(ULTRACANVAS_ENABLE_GL    OFF CACHE BOOL "" FORCE)
-set(ULTRACANVAS_ENABLE_AUDIO OFF CACHE BOOL "" FORCE)
-set(ULTRACANVAS_ENABLE_VIDEO OFF CACHE BOOL "" FORCE)
-set(ULTRACANVAS_ENABLE_NET   OFF CACHE BOOL "" FORCE)
+#
+# ULTRACANVAS_ENABLE_DATABASE is especially important to turn OFF: its UltraDatabase module
+# links the *system* libsqlite3, which collides with Ladybird's vcpkg libsqlite3 in the final
+# executable. With two sqlite libraries loaded, LibDatabase runs against the wrong one and every
+# prepared statement fails at startup with "SQL logic error" (only reproduces here, not in Qt).
+set(ULTRACANVAS_BUILD_SHARED   OFF CACHE BOOL "" FORCE)
+set(ULTRACANVAS_ENABLE_GL      OFF CACHE BOOL "" FORCE)
+set(ULTRACANVAS_ENABLE_AUDIO   OFF CACHE BOOL "" FORCE)
+set(ULTRACANVAS_ENABLE_VIDEO   OFF CACHE BOOL "" FORCE)
+set(ULTRACANVAS_ENABLE_NET     OFF CACHE BOOL "" FORCE)
+set(ULTRACANVAS_ENABLE_DATABASE OFF CACHE BOOL "" FORCE)
 foreach(_uc_plugin
         CDR VECTOR XAR SVG PDF OCR VECTORIZER LATEX
         SMTP IMAP POP3 JMAP WEBDAV LDAP TELNET RTSP MQTT AMQP COAP
@@ -45,6 +51,7 @@ add_subdirectory(UltraCanvasSources/UltraCanvas)
 add_executable(ladybird main.cpp)
 target_sources(ladybird PRIVATE
     Application.cpp
+    Bookmarks.cpp
     EventLoopImplementationUltraCanvas.cpp
     UltraCanvasPlatform.cpp
     WebContentView.cpp

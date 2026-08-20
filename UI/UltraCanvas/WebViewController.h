@@ -36,6 +36,24 @@ public:
     virtual void navigate_back() = 0;
     virtual void navigate_forward() = 0;
 
+    virtual void zoom_in() = 0;
+    virtual void zoom_out() = 0;
+    virtual void reset_zoom() = 0;
+    // Set an exact zoom factor (1.0 = 100%; clamped by the engine to [0.3, 5.0]).
+    virtual void set_zoom(double factor) = 0;
+    // Current zoom factor of this view (1.0 = 100%).
+    virtual double current_zoom() const = 0;
+
+    // Find-in-page. start_find highlights all matches and jumps to the first;
+    // find_next/find_previous cycle; stop_find clears the highlight.
+    virtual void start_find(StringView query) = 0;
+    virtual void find_next() = 0;
+    virtual void find_previous() = 0;
+    virtual void stop_find() = 0;
+
+    // Bookmark (or un-bookmark) the current page.
+    virtual void toggle_bookmark() = 0;
+
     // Set the on-screen size of the web view, in window (logical) pixels. Called by
     // the chrome from the authoritative X11 window size (initially and on resize) —
     // the view must NOT derive this from its own laid-out width, which feeds back
@@ -48,7 +66,12 @@ public:
 
     Function<void(String)> on_url_change;
     Function<void(String)> on_title_change;
+    // The page's favicon changed; the argument is a base64-encoded PNG (empty to clear).
+    Function<void(String favicon_base64_png)> on_favicon_change;
     Function<void(bool loading)> on_loading_state_change;
+    // Reports find results: 1-based index of the active match and the total count
+    // (both 0 when there are no matches).
+    Function<void(size_t current, size_t total)> on_find_result;
 };
 
 // The view exposed as both its control interface and its UltraCanvas element (for
@@ -58,7 +81,8 @@ struct WebViewHandle {
     std::shared_ptr<UltraCanvas::UltraCanvasUIElement> element;
 };
 
-// Creates a web-content view, spawning/attaching its WebContent process.
-WebViewHandle create_web_content_view();
+// Creates a web-content view, spawning/attaching its WebContent process. When is_private is
+// true the view uses a private WebContent client (private cookies, ephemeral storage, no history).
+WebViewHandle create_web_content_view(bool is_private = false);
 
 }

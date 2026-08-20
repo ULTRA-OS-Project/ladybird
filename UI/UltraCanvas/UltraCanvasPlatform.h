@@ -8,6 +8,7 @@
 
 #include <functional>
 #include <string>
+#include <vector>
 
 // X11 firewall.
 //
@@ -46,5 +47,37 @@ void show_alert_dialog(std::string const& message, std::function<void()> on_clos
 void show_confirm_dialog(std::string const& message, std::function<void(bool accepted)> on_close);
 void show_prompt_dialog(std::string const& message, std::string const& default_value,
     std::function<void(bool accepted, std::string const& text)> on_close);
+
+// A toolkit-agnostic description of one context-menu entry. The LibWebView-side view
+// builds a tree of these from a WebView::Menu (so no LibWebView types cross into the
+// X11 side) and hands it to show_context_menu().
+struct ContextMenuItem {
+    std::string label;
+    bool is_separator { false };
+    bool enabled { true };
+    bool checkable { false };
+    bool checked { false };
+    std::function<void()> on_activate;   // invoked on the UI thread when clicked
+    std::vector<ContextMenuItem> submenu; // non-empty => this item opens a submenu
+};
+
+// Pop up a context menu at (window_x, window_y) — window-relative coordinates — on the
+// focused browser window. Non-blocking; dismissed by click-outside or Escape.
+void show_context_menu(std::vector<ContextMenuItem> items, int window_x, int window_y);
+
+// Pop up an HTML <select> dropdown at (window_x, window_y). Like show_context_menu, but if the
+// menu is dismissed WITHOUT choosing an item, on_dismiss is invoked exactly once (the engine
+// needs a select_dropdown_closed({}) to unblock). Choosing an item runs its on_activate instead.
+// minimum_width (logical px, the <select>'s width; 0 = auto) makes the popup at least that wide.
+void show_select_dropdown(std::vector<ContextMenuItem> items, int window_x, int window_y, int minimum_width, std::function<void()> on_dismiss);
+
+// Show a blocking native "Save As" dialog, seeded with initial_directory + suggested_name.
+// Returns the chosen absolute path, or an empty string if the user cancelled (or no dialog
+// could be shown). Blocks until dismissed — used for the synchronous download-path prompt.
+std::string show_save_file_dialog(std::string const& title, std::string const& initial_directory, std::string const& suggested_name);
+
+// Show a blocking native "Open File" dialog. Returns the chosen absolute path, or an empty
+// string if the user cancelled (or no dialog could be shown). Used for Ctrl+O / "Open File…".
+std::string show_open_file_dialog(std::string const& title, std::string const& initial_directory);
 
 }
