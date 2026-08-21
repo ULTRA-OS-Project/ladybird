@@ -135,6 +135,12 @@ public:
     // holds the latest engine suggestions ({display, navigation value}) fed to onRequestSuggestions.
     std::shared_ptr<UltraCanvas::UltraCanvasAutoComplete> address_autocomplete;
     std::vector<std::pair<std::string, std::string>> ac_cache;
+    // The user's last typed query (NOT the inline-completed text), used to drop stale async results —
+    // the completed text keeps changing, so it can't be the freshness key.
+    std::string ac_query;
+    // Set when the user presses Backspace/Delete; suppresses re-applying an inline completion for the
+    // next results delivery (so a deleted completion doesn't instantly grow back). One-shot.
+    bool suppress_inline_completion { false };
     // Toolbar downloads button; shown with a count while downloads are active.
     std::shared_ptr<UltraCanvas::UltraCanvasButton> downloads_button;
     std::shared_ptr<UltraCanvas::UltraCanvasTabbedContainer> tab_container;
@@ -897,9 +903,11 @@ void open_browser_window(WebViewHandle const& first_view, StringView initial_url
     auto reload_button = toolbar->AddButton("reload", "", "", [self] { if (auto s = self.lock()) if (auto* c = s->active_controller()) c->reload(); });
     set_toolbar_icon(reload_button, "resource://icons/browser/rotate-cw.svg"sv);
 
-    // The address bar is an autocomplete control: typing queries the engine (history + bookmarks +
-    // search suggestions) asynchronously; results are pushed into ac_cache and shown via the
-    // control's built-in popup (which handles Up/Down/Enter selection natively).
+    // The address bar is an autocomplete control in "omnibox mode" (Chrome-style): typing queries the
+    // engine (history + bookmarks + search suggestions) asynchronously; the top prefix-extending
+    // suggestion is inline-completed into the field with the suffix selected, Up/Down copies the
+    // highlighted suggestion into the field, and Enter navigates to the field text (see the key filter
+    // + onItemSelected below).
     auto address_bar = toolbar->AddAutoComplete("address-bar", "Enter address", [self](std::string const& text) {
         auto s = self.lock();
         if (!s)
@@ -907,35 +915,46 @@ void open_browser_window(WebViewHandle const& first_view, StringView initial_url
         // Remember the in-progress edit for the active tab so switching tabs saves/restores it.
         if (auto ai = s->active_index(); ai >= 0 && ai < static_cast<int>(s->tabs.size()))
             s->tabs[ai].address_text = text;
+        // Typing (growing the query) lifts delete-suppression; a delete keeps it so the completion
+        // doesn't grow back on a later (possibly delayed) results delivery for the same query.
+        if (text.length() > s->ac_query.length())
+            s->suppress_inline_completion = false;
+        s->ac_query = text; // freshness key for async results (survives inline completion)
         if (text.empty()) {
             s->ac_cache.clear();
             if (s->address_autocomplete)
                 s->address_autocomplete->RefreshSuggestions();
             return;
         }
-        request_autocomplete(text, s->is_private, [self](std::string query, std::vector<std::pair<std::string, std::string>> results) {
+        request_autocomplete(text, s->is_private, [self](std::string query, std::vector<std::pair<std::string, std::string>> results, std::string completed_text, int selection_start) {
             auto s2 = self.lock();
             if (!s2 || !s2->address_autocomplete)
                 return;
-            // Drop stale responses: the user kept typing since this query was issued.
-            if (s2->address_autocomplete->GetText() != query)
+            // Drop stale responses: compare against the typed query (GetText() may hold a completion).
+            if (s2->ac_query != query)
                 return;
             s2->ac_cache = std::move(results);
             s2->address_autocomplete->RefreshSuggestions();
+
+            // Apply Chrome-style inline completion, unless the user just deleted (suppression stays set
+            // until the query grows again — the engine can deliver several times per query) or moved
+            // the caret away from the end. SetText+SetSelection leaves the suffix selected so the next
+            // keystroke replaces it and Del removes it.
+            if (selection_start >= 0 && !s2->suppress_inline_completion) {
+                auto& ac = *s2->address_autocomplete;
+                if (ac.GetCaretPosition() == ac.GetText().length()) {
+                    ac.SetText(completed_text);
+                    ac.SetSelection(static_cast<size_t>(selection_start), completed_text.length());
+                }
+            }
         });
     });
     state->address_autocomplete = address_bar;
     state->address_bar = address_bar; // upcast; existing chrome uses the TextInput base API
     if (address_bar) {
+        address_bar->SetOmniboxMode(true);
         address_bar->SetElementSize(UltraCanvas::CSSLayout::Dimension::Px(0), UltraCanvas::CSSLayout::Dimension::Px(28));
         address_bar->layoutItem.SetFlexGrow(1.0f);
-        // Enter navigates to the typed text (works when no suggestion popup is open).
-        address_bar->onEnterPressed = [self](std::string const& text) -> bool {
-            if (auto s = self.lock())
-                if (auto* c = s->active_controller())
-                    c->load(StringView { text.data(), text.length() });
-            return true;
-        };
         // Provider: hand the control our async-populated suggestions as-is (already ranked).
         address_bar->onRequestSuggestions = [self](std::string const&) -> std::vector<UltraCanvas::AutoCompleteItem> {
             std::vector<UltraCanvas::AutoCompleteItem> items;
@@ -946,13 +965,16 @@ void open_browser_window(WebViewHandle const& first_view, StringView initial_url
             }
             return items;
         };
-        // Picking a suggestion navigates to its value (URL or search term).
-        address_bar->onItemSelected = [self](int, UltraCanvas::AutoCompleteItem const& item) {
+        // Clicking a suggestion: SelectItem already put its text in the field, so navigate the field
+        // text (keeps "navigate the input text only" true for clicks as well as Enter).
+        address_bar->onItemSelected = [self](int, UltraCanvas::AutoCompleteItem const&) {
             auto s = self.lock();
-            if (!s)
+            if (!s || !s->address_autocomplete)
                 return;
-            if (auto* c = s->active_controller())
-                c->load(StringView { item.value.data(), item.value.length() });
+            if (auto* c = s->active_controller()) {
+                auto url = s->address_autocomplete->GetText();
+                c->load(StringView { url.data(), url.length() });
+            }
         };
     }
 
@@ -1120,6 +1142,31 @@ void open_browser_window(WebViewHandle const& first_view, StringView initial_url
             if (event.virtualKey == UltraCanvas::UCKeys::F11) {
                 s->window->SetFullscreen(!s->window->IsFullscreen());
                 return true;
+            }
+            // Omnibox keys while the address bar is focused (no modifier). Handled here — before the
+            // control's own OnEvent — so navigation always uses the field text, never a hidden row.
+            if (s->address_autocomplete && s->address_autocomplete->IsFocused()) {
+                switch (event.virtualKey) {
+                case UltraCanvas::UCKeys::Return: // navigate to the field text (typed or completed)
+                    s->address_autocomplete->CloseAutocompletePopup();
+                    if (auto* c = s->active_controller()) {
+                        auto url = s->address_autocomplete->GetText();
+                        c->load(StringView { url.data(), url.length() });
+                    }
+                    return true;
+                case UltraCanvas::UCKeys::Escape: // close the suggestion popup if open
+                    if (s->address_autocomplete->IsPopupOpen()) {
+                        s->address_autocomplete->CloseAutocompletePopup();
+                        return true;
+                    }
+                    break;
+                case UltraCanvas::UCKeys::Backspace: // a delete rejects the current inline completion
+                case UltraCanvas::UCKeys::Delete:
+                    s->suppress_inline_completion = true;
+                    return false; // let the input perform the actual deletion
+                default:
+                    break;
+                }
             }
             if (!event.ctrl)
                 return false;
